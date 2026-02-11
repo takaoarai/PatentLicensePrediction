@@ -198,3 +198,197 @@ def timestamp_to_days(timestamp_ms):
         int: Number of days since epoch
     """
     return int(timestamp_ms / (1000 * 60 * 60 * 24))
+
+
+# ============================================================
+# Data Loading for Training
+# ============================================================
+
+def load_preprocessed_data(data_dir, start_year, end_year, logger=None):
+    """
+    Load preprocessed patent data for training.
+    
+    Args:
+        data_dir: Directory containing patents_*.parquet files
+        start_year: Start year for data filtering
+        end_year: End year for data filtering
+        logger: Optional logger instance (if None, uses print)
+    
+    Returns:
+        pandas.DataFrame: Combined DataFrame with all records
+    """
+    import pandas as pd
+    
+    data_dir = Path(data_dir)
+    
+    if not data_dir.exists():
+        raise FileNotFoundError(f"Data directory not found: {data_dir}")
+    
+    log_fn = logger.info if logger else print
+    
+    log_fn(f"Loading data from: {data_dir}")
+    log_fn(f"Year range: {start_year}-{end_year}")
+    
+    # Find parquet files
+    parquet_files = list(data_dir.glob("*.parquet"))
+    
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files found in: {data_dir}")
+    
+    log_fn(f"Found {len(parquet_files)} parquet files")
+    
+    # Filter by year
+    files = sorted([
+        f for f in parquet_files 
+        if f.name.startswith("patents_") and f.name.endswith(".parquet")
+    ])
+    
+    selected_files = []
+    for f in files:
+        try:
+            # Extract year from filename: patents_YYYY_*.parquet
+            year = int(f.name.split('_')[1])
+            if start_year <= year <= end_year:
+                selected_files.append(f)
+        except (IndexError, ValueError):
+            log_fn(f"Warning: Could not extract year from filename: {f.name}")
+            continue
+    
+    if not selected_files:
+        raise ValueError(
+            f"No files found for the specified period ({start_year}-{end_year})"
+        )
+    
+    log_fn(f"Selected {len(selected_files)} files for processing")
+    
+    # Load and concatenate dataframes
+    dataframes = []
+    total_records = 0
+    
+    for file_path in selected_files:
+        try:
+            log_fn(f"  Loading: {file_path.name}")
+            
+            # Check file size
+            if file_path.stat().st_size == 0:
+                log_fn(f"    Warning: Empty file - skipping")
+                continue
+            
+            # Load parquet file
+            df_chunk = pd.read_parquet(file_path)
+            
+            if len(df_chunk) == 0:
+                log_fn(f"    Warning: No data - skipping")
+                continue
+            
+            record_count = len(df_chunk)
+            total_records += record_count
+            
+            log_fn(f"    Loaded: {record_count} records")
+            dataframes.append(df_chunk)
+                
+        except Exception as e:
+            log_fn(f"    Error loading file: {e}")
+            continue
+    
+    if not dataframes:
+        raise ValueError(f"No valid data could be loaded")
+    
+    # Concatenate all dataframes
+    result_df = pd.concat(dataframes, ignore_index=True)
+    
+    log_fn(f"\n=== Data Loading Summary ===")
+    log_fn(f"Total records: {len(result_df)}")
+    log_fn(f"Event rate: {(result_df['s']==1).sum()} / {len(result_df)} "
+           f"({(result_df['s']==1).mean()*100:.2f}%)")
+    
+    return result_df
+
+
+# ============================================================
+# PyTorch Utilities
+# ============================================================
+
+def custom_collate_fn(batch):
+    """
+    Custom collate function for variable-length data (7 elements).
+    
+    Used for survival analysis models (DeepSurv, Cure).
+    
+    Args:
+        batch: List of tuples (num_claims, backward_cites, embeddings, 
+                              cpc_ids, app_ids, t_normalized, s)
+    
+    Returns:
+        Tuple of padded tensors
+    """
+    import torch
+    
+    num_claims, backward_cites, embeddings, cpc_ids, app_ids, t_normalized, s = zip(*batch)
+    
+    # Fixed-length data
+    num_claims = torch.stack(num_claims)
+    backward_cites = torch.stack(backward_cites)
+    embeddings = torch.stack(embeddings)
+    t_normalized = torch.stack(t_normalized)
+    s = torch.stack(s)
+    
+    # Variable-length data padding
+    max_cpc_len = max(len(ids) for ids in cpc_ids)
+    max_app_len = max(len(ids) for ids in app_ids)
+    
+    # CPC padding (0 is padding value)
+    padded_cpc = torch.zeros((len(cpc_ids), max_cpc_len), dtype=torch.long)
+    for i, ids in enumerate(cpc_ids):
+        if len(ids) > 0:
+            padded_cpc[i, :len(ids)] = ids
+    
+    # Applicant padding (0 is padding value)
+    padded_app = torch.zeros((len(app_ids), max_app_len), dtype=torch.long)
+    for i, ids in enumerate(app_ids):
+        if len(ids) > 0:
+            padded_app[i, :len(ids)] = ids
+    
+    return num_claims, backward_cites, embeddings, padded_cpc, padded_app, t_normalized, s
+
+
+def custom_collate_fn_6(batch):
+    """
+    Custom collate function for variable-length data (6 elements).
+    
+    Used for binary classification models.
+    
+    Args:
+        batch: List of tuples (num_claims, backward_cites, embeddings, 
+                              cpc_ids, app_ids, label)
+    
+    Returns:
+        Tuple of padded tensors
+    """
+    import torch
+    
+    num_claims, backward_cites, embeddings, cpc_ids, app_ids, labels = zip(*batch)
+    
+    # Fixed-length data
+    num_claims = torch.stack(num_claims)
+    backward_cites = torch.stack(backward_cites)
+    embeddings = torch.stack(embeddings)
+    labels = torch.stack(labels)
+    
+    # Variable-length data padding
+    max_cpc_len = max(len(ids) for ids in cpc_ids)
+    max_app_len = max(len(ids) for ids in app_ids)
+    
+    # CPC padding
+    padded_cpc = torch.zeros((len(cpc_ids), max_cpc_len), dtype=torch.long)
+    for i, ids in enumerate(cpc_ids):
+        if len(ids) > 0:
+            padded_cpc[i, :len(ids)] = ids
+    
+    # Applicant padding
+    padded_app = torch.zeros((len(app_ids), max_app_len), dtype=torch.long)
+    for i, ids in enumerate(app_ids):
+        if len(ids) > 0:
+            padded_app[i, :len(ids)] = ids
+    
+    return num_claims, backward_cites, embeddings, padded_cpc, padded_app, labels
